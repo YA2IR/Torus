@@ -186,21 +186,6 @@ static void destroy_frame_buffer(frame_buffer *frame)
     free(frame);
 }
 
-static void write_pixel(frame_buffer *frame, int x, int y, double depth, pixel color)
-{
-    if (x < 0 || x >= frame->width || y < 0 || y >= frame->height) {
-        return;
-    }
-    int pixel_idx = y * frame->width + x;
-
-    if (depth <= frame->depths[pixel_idx]) {
-        return;
-    }
-
-    frame->depths[pixel_idx] = depth;
-    frame->pixels[pixel_idx] = color;
-}
-
 static double edge_function(
     projected_point edge_start,
     projected_point edge_end,
@@ -232,6 +217,9 @@ static void draw_triangle(
         return;
     }
 
+    const double edge_to_weight_scale = 1.0 / fabs(triangle_signed_area);
+    const double edge_sign = triangle_signed_area < 0.0 ? -1.0 : 1.0;
+
     int leftmost_pixel = (int) floor(fmin(a.x, fmin(b.x, c.x)));
     int rightmost_pixel = (int) ceil(fmax(a.x, fmax(b.x, c.x)));
     int top_pixel = (int) floor(fmin(a.y, fmin(b.y, c.y)));
@@ -255,53 +243,78 @@ static void draw_triangle(
     if (bottom_pixel >= frame->height)
         bottom_pixel = frame->height - 1;
 
+    // we're advancing the edge values incrementally instead of recomputing edge_function three times for every pixel
+    double a_row_edge = edge_function(b, c, leftmost_pixel + 0.5, top_pixel + 0.5) * edge_sign;
+    double b_row_edge = edge_function(c, a, leftmost_pixel + 0.5, top_pixel + 0.5) * edge_sign;
+    double c_row_edge = edge_function(a, b, leftmost_pixel + 0.5, top_pixel + 0.5) * edge_sign;
+
+    const double a_x_step = -(c.y - b.y) * edge_sign;
+    const double b_x_step = -(a.y - c.y) * edge_sign;
+    const double c_x_step = -(b.y - a.y) * edge_sign;
+
+    const double a_y_step = (c.x - b.x) * edge_sign;
+    const double b_y_step = (a.x - c.x) * edge_sign;
+    const double c_y_step = (b.x - a.x) * edge_sign;
+
     for (int y = top_pixel; y <= bottom_pixel; y++) {
+        double a_edge_for_pixel = a_row_edge;
+        double b_edge_for_pixel = b_row_edge;
+        double c_edge_for_pixel = c_row_edge;
+
         for (int x = leftmost_pixel; x <= rightmost_pixel; x++) {
-            // test the _center_ of the pixel, not the top-left corner
-            double pixel_x = x + 0.5;
-            double pixel_y = y + 0.5;
+            if (
+                a_edge_for_pixel >= 0.0 &&
+                b_edge_for_pixel >= 0.0 &&
+                c_edge_for_pixel >= 0.0
+            ) {
+                double a_weight = a_edge_for_pixel * edge_to_weight_scale;
+                double b_weight = b_edge_for_pixel * edge_to_weight_scale;
+                double c_weight = c_edge_for_pixel * edge_to_weight_scale;
 
-            double a_weight =
-                edge_function(b, c, pixel_x, pixel_y) / triangle_signed_area;
-            double b_weight =
-                edge_function(c, a, pixel_x, pixel_y) / triangle_signed_area;
-            double c_weight =
-                edge_function(a, b, pixel_x, pixel_y) / triangle_signed_area;
+                double weighted_depth =
+                    a.depth * a_weight +
+                    b.depth * b_weight +
+                    c.depth * c_weight;
 
-            // outside the triangle
-            if (a_weight < 0.0 || b_weight < 0.0 || c_weight < 0.0)
-                continue;
+                int pixel_idx = y * frame->width + x;
 
-            double weighted_depth =
-                a.depth * a_weight +
-                b.depth * b_weight +
-                c.depth * c_weight;
+                if (weighted_depth > frame->depths[pixel_idx]) {
+                    vec3 weighted_normal = unit_vector((vec3) {
+                        a.normal.x * a_weight + b.normal.x * b_weight + c.normal.x * c_weight,
+                        a.normal.y * a_weight + b.normal.y * b_weight + c.normal.y * c_weight,
+                        a.normal.z * a_weight + b.normal.z * b_weight + c.normal.z * c_weight,
+                    });
 
-            vec3 weighted_normal = unit_vector((vec3) {
-                a.normal.x * a_weight + b.normal.x * b_weight + c.normal.x * c_weight,
-                a.normal.y * a_weight + b.normal.y * b_weight + c.normal.y * c_weight,
-                a.normal.z * a_weight + b.normal.z * b_weight + c.normal.z * c_weight,
-            });
+                    double direct_light =
+                        weighted_normal.x * LIGHT_DIRECTION.x +
+                        weighted_normal.y * LIGHT_DIRECTION.y +
+                        weighted_normal.z * LIGHT_DIRECTION.z;
 
-            double direct_light =
-                weighted_normal.x * LIGHT_DIRECTION.x +
-                weighted_normal.y * LIGHT_DIRECTION.y +
-                weighted_normal.z * LIGHT_DIRECTION.z;
+                    if (direct_light < 0.0)
+                        direct_light = 0.0;
 
-            if (direct_light < 0.0)
-                direct_light = 0.0;
+                    double brightness = MIN_LIGHT + (1.0 - MIN_LIGHT) * direct_light;
 
-            double brightness = MIN_LIGHT + (1.0 - MIN_LIGHT) * direct_light;
+                    pixel shaded_color = {
+                        (uint8_t)(color.red * brightness + 0.5),
+                        (uint8_t)(color.green * brightness + 0.5),
+                        (uint8_t)(color.blue * brightness + 0.5),
+                        color.alpha,
+                    };
 
-            pixel shaded_color = {
-                (uint8_t)round(color.red * brightness),
-                (uint8_t)round(color.green * brightness),
-                (uint8_t)round(color.blue * brightness),
-                color.alpha,
-            };
+                    frame->depths[pixel_idx] = weighted_depth;
+                    frame->pixels[pixel_idx] = shaded_color;
+                }
+            }
 
-            write_pixel(frame, x, y, weighted_depth, shaded_color);
+            a_edge_for_pixel += a_x_step;
+            b_edge_for_pixel += b_x_step;
+            c_edge_for_pixel += c_x_step;
         }
+
+        a_row_edge += a_y_step;
+        b_row_edge += b_y_step;
+        c_row_edge += c_y_step;
     }
 }
 
